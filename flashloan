@@ -1,0 +1,467 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.27;
+
+import { Strings } from "@openzeppelin/contracts/utils/Strings.sol";
+import { IQuoter } from "@uniswap/v3-periphery/contracts/interfaces/IQuoter.sol";
+import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import { IPoolAddressesProvider } from "@aave/core-v3/contracts/interfaces/IPoolAddressesProvider.sol";
+import { IPool } from "@aave/core-v3/contracts/interfaces/IPool.sol";
+import { DataTypes } from "@aave/core-v3/contracts/protocol/libraries/types/DataTypes.sol";
+
+abstract contract ReentrancyGuard {
+    uint256 private constant NOT_ENTERED = 1;
+    uint256 private constant ENTERED = 2;
+
+    uint256 private status;
+
+    constructor() {
+        status = NOT_ENTERED;
+    }
+
+    modifier nonReentrant() {
+        require(status != ENTERED, "ReentrancyGuard: reentrant call");
+        status = ENTERED;
+        _;
+        status = NOT_ENTERED;
+    }
+}
+
+abstract contract Context {
+    function _msgSender() internal view virtual returns (address) {
+        return msg.sender;
+    }
+
+    function _msgData() internal view virtual returns (bytes calldata) {
+        return msg.data;
+    }
+}
+
+abstract contract Ownable is Context {
+    address private ownerAddress;
+
+    event OwnershipTransferred(address indexed previousOwner, address indexed newOwner);
+
+    constructor(address initialOwner) {
+        require(initialOwner != address(0), "Invalid owner address");
+        _transferOwnership(initialOwner);
+    }
+
+    function owner() public view virtual returns (address) {
+        return ownerAddress;
+    }
+
+    modifier onlyOwner() {
+        require(owner() == _msgSender(), "Caller is not the owner");
+        _;
+    }
+
+    function transferOwnership(address newOwner) public virtual onlyOwner {
+        require(newOwner != address(0), "New owner is zero address");
+        _transferOwnership(newOwner);
+    }
+
+    function _transferOwnership(address newOwner) internal virtual {
+        address oldOwner = ownerAddress;
+        ownerAddress = newOwner;
+        emit OwnershipTransferred(oldOwner, newOwner);
+    }
+}
+
+interface ISwapRouter {
+    function exactInputSingle(
+        ISwapRouter.ExactInputSingleParams calldata params
+    ) external returns (uint256 amountOut);
+
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+}
+
+contract Arbitrage is ReentrancyGuard, Ownable {
+    using Strings for uint256;
+    
+    uint256 public maxSlippagePercent = 1;
+    address public quoterAddress;
+    address public wethAddress;
+    address public uniswapRouter;
+    address public sushiswapRouter;
+    address public assetToTrade;
+    address public aaveLendingPool;
+    uint256 public numArbitrageCycles;
+    uint256 public internalFund;
+
+    mapping(address => License) public licenses;
+    mapping(address => address) public referrals;
+    address public constant REWARD_WALLET = 0x709511F9b983C393D72d61ff5eC066d9297Deed2;
+
+    struct License {
+        uint256 price;
+        uint256 loanAmount;
+        uint256 dailyLimit;
+        uint256 startTime;
+        uint256 arbitrageCount;
+        uint256 totalProfit;
+        uint256 leverage;
+        bool active;
+    }
+
+    constructor(
+        address _aaveLendingPool,
+        address _uniswapRouter,
+        address _sushiswapRouter,
+        uint256 _numArbitrageCycles,
+        address _assetToTrade,
+        address _ownerAddress,
+        address _quoterAddress,
+        address _wethAddress
+    ) Ownable(_ownerAddress) {
+        require(_aaveLendingPool != address(0), "Invalid Aave address");
+        require(_uniswapRouter != address(0), "Invalid Uniswap address");
+        require(_sushiswapRouter != address(0), "Invalid Sushiswap address");
+        require(_assetToTrade != address(0), "Invalid asset address");
+        require(_quoterAddress != address(0), "Invalid Quoter address");
+        require(_wethAddress != address(0), "Invalid WETH address");
+
+        aaveLendingPool = _aaveLendingPool;
+        uniswapRouter = _uniswapRouter;
+        sushiswapRouter = _sushiswapRouter;
+        numArbitrageCycles = _numArbitrageCycles;
+        assetToTrade = _assetToTrade;
+        quoterAddress = _quoterAddress;
+        wethAddress = _wethAddress;
+    }
+
+    event LicenseStored(address indexed user, uint256 price, uint256 loanAmount, uint256 dailyLimit, uint256 leverage, bool active);
+    event LicensePurchased(address indexed user, uint256 licenseType, uint256 price, address referrer);
+    event InternalFundUpdated(uint256 newInternalFund);
+    event LicenseStatus(address indexed user, bool isActive, uint256 arbitrageCount, uint256 dailyLimit, uint256 price);
+
+    function purchaseLicense(uint256 licenseType, address referrer) external nonReentrant payable {
+        License storage userLicense = licenses[msg.sender];
+        require(licenseType >= 1 && licenseType <= 4, "Invalid license type");
+        require(!userLicense.active || (userLicense.price == 0), "Not eligible for new purchase");
+
+        uint256 licensePrice;
+        uint256 loanAmount;
+        uint256 dailyLimit;
+        uint256 leverage;
+
+        if (licenseType == 1) {
+            licensePrice = 5 * 10**6;
+            loanAmount = 1 * 10**6;
+            dailyLimit = 3;
+            leverage = 175;
+        } else if (licenseType == 2) {
+            licensePrice = 150 * 10**6;
+            loanAmount = 3000 * 10**6;
+            dailyLimit = 5;
+            leverage = 200;
+        } else if (licenseType == 3) {
+            licensePrice = 750 * 10**6;
+            loanAmount = 10000 * 10**6;
+            dailyLimit = 10;
+            leverage = 225;
+        } else {
+            licensePrice = 1250 * 10**6;
+            loanAmount = 15000 * 10**6;
+            dailyLimit = 15;
+            leverage = 250;
+        }
+
+        IERC20 usdt = IERC20(assetToTrade);
+        require(usdt.transferFrom(msg.sender, address(this), licensePrice), "USDT transfer failed");
+
+        uint256 commission = (licensePrice * 20) / 100;
+        uint256 contractShare = (licensePrice * 50) / 100;
+        uint256 ownerShare = (licensePrice * 30) / 100;
+
+        require(usdt.transfer(REWARD_WALLET, commission), "Commission transfer failed");
+        require(usdt.transfer(owner(), ownerShare), "Owner share transfer failed");
+
+        internalFund += contractShare;
+        emit InternalFundUpdated(internalFund);
+
+        licenses[msg.sender] = License({
+            price: licensePrice,
+            loanAmount: loanAmount,
+            dailyLimit: dailyLimit,
+            startTime: block.timestamp,
+            arbitrageCount: 0,
+            totalProfit: 0,
+            leverage: leverage,
+            active: true
+        });
+
+        emit LicensePurchased(msg.sender, licenseType, licensePrice, referrer);
+        emit LicenseStored(msg.sender, licensePrice, loanAmount, dailyLimit, leverage, true);
+
+        if (referrer != address(0) && referrals[msg.sender] == address(0)) {
+            referrals[msg.sender] = referrer;
+            payReferralRewards(referrer, commission);
+        }
+
+        emit LicenseStatus(msg.sender, licenses[msg.sender].active, licenses[msg.sender].arbitrageCount, licenses[msg.sender].dailyLimit, licenses[msg.sender].price);
+    }
+
+    function payReferralRewards(address referrer, uint256 amount) internal {
+        address level1 = referrer;
+        address level2 = referrals[level1];
+        address level3 = (level2 != address(0)) ? referrals[level2] : address(0);
+        address level4 = (level3 != address(0)) ? referrals[level3] : address(0);
+
+        uint256 baseAmount = amount / 100;
+        uint256[4] memory rewards = [baseAmount * 10, baseAmount * 5, baseAmount * 3, baseAmount * 2];
+        address[4] memory referralLevels = [level1, level2, level3, level4];
+
+        IERC20 usdt = IERC20(assetToTrade);
+
+        for (uint256 i = 0; i < 4; i++) {
+            if (referralLevels[i] != address(0)) {
+                usdt.transfer(referralLevels[i], rewards[i]);
+            }
+        }
+    }
+
+    function getAmountOutMin(uint256 amountIn, address quoter) internal returns (uint256) {
+        IQuoter quoterContract = IQuoter(quoter);
+        uint256 quotedAmount = quoterContract.quoteExactInputSingle(
+            assetToTrade,
+            wethAddress,
+            3000,
+            amountIn,
+            0
+        );
+
+        uint256 slippageAmount = (quotedAmount * maxSlippagePercent) / 100;
+        return quotedAmount - slippageAmount;
+    }
+
+    function setMaxSlippagePercent(uint256 newSlippage) external onlyOwner {
+        require(newSlippage <= 100, "Slippage too high");
+        maxSlippagePercent = newSlippage;
+    }
+
+    function swapTokens(uint256 amountIn, uint256 amountOutMin, address router) internal {
+        ISwapRouter swapRouter = ISwapRouter(router);
+
+        ISwapRouter.ExactInputSingleParams memory params = ISwapRouter.ExactInputSingleParams({
+            tokenIn: assetToTrade,
+            tokenOut: wethAddress,
+            fee: 3000,
+            recipient: address(this),
+            deadline: block.timestamp,
+            amountIn: amountIn,
+            amountOutMinimum: amountOutMin,
+            sqrtPriceLimitX96: 0
+        });
+
+        swapRouter.exactInputSingle(params);
+    }
+
+    event ArbitrageExecuted(address indexed user, uint256 profit, uint256 timestamp);
+    event ArbitragePaused(address indexed user);
+    event DebugFlashLoanCall(address indexed user, bool success, string reason);
+    event FlashLoanSuccess(address indexed user, uint256 amount);
+    event FlashLoanFailure(address indexed user, string reason);
+    event FlashLoanInitiated(address indexed user, uint256 amount);  // Novo evento
+
+    function executeFlashLoan() external nonReentrant {
+        // Acessa a licença do usuário
+        License storage userLicense = licenses[msg.sender];
+
+        // Log para depurar o estado da licença
+        emit Debug(string(abi.encodePacked("Executando flash loan para: ", Strings.toHexString(uint256(uint160(msg.sender)), 20))));
+        emit Debug(string(abi.encodePacked("License ativa: ", userLicense.active ? "true" : "false")));
+        emit Debug(string(abi.encodePacked("License price: ", Strings.toString(userLicense.price))));
+        emit Debug(string(abi.encodePacked("Loan Amount: ", Strings.toString(userLicense.loanAmount))));
+
+        // Verifica se a licença ainda é válida
+        require(userLicense.price > 0 && userLicense.active, "No valid license or license inactive");
+
+        // Log de checagem de limite diário
+        uint256 currentTime = block.timestamp;
+        emit Debug(string(abi.encodePacked("Current Time: ", Strings.toString(currentTime))));
+        require(userLicense.arbitrageCount < userLicense.dailyLimit, "Daily limit reached");
+
+        // Log para reinicializar o contador se 24 horas se passaram
+        if (currentTime > userLicense.startTime + 1 days) {
+            userLicense.arbitrageCount = 0;
+            userLicense.startTime = currentTime;
+        }
+
+        // Log de preparação dos valores do empréstimo flash
+        uint256 loanAmount = userLicense.loanAmount;
+        emit Debug(string(abi.encodePacked("Loan Amount configurado: ", Strings.toString(loanAmount))));
+
+        // Inicializa os arrays necessários para a operação de Flash Loan
+        address[] memory assets = new address[](1);
+        uint256[] memory amounts = new uint256[](1);
+        uint256[] memory interestRateModes = new uint256[](1);
+
+        assets[0] = assetToTrade;
+        amounts[0] = loanAmount;
+        interestRateModes[0] = 2; // 0 = taxa estável 2 = taxa variável
+
+        emit Debug(string(abi.encodePacked("Asset to trade: ", Strings.toHexString(uint256(uint160(assetToTrade)), 20))));
+        emit Debug(string(abi.encodePacked("Amount to borrow: ", Strings.toString(loanAmount))));
+        emit Debug(string(abi.encodePacked("Interest Rate Mode: ", Strings.toString(interestRateModes[0]))));
+
+        // Cria os parâmetros adicionais que serão passados para a função callback (executeOperation)
+        bytes memory params = abi.encode(msg.sender, loanAmount);
+        emit Debug("Parametros para flash loan codificados.");
+
+        // Emissão de evento para marcar o início do flash loan
+        emit FlashLoanInitiated(msg.sender, loanAmount);
+
+        // Executa o flash loan com o Aave Pool
+        try IPool(aaveLendingPool).flashLoan(
+            address(this),      // O contrato que vai receber o empréstimo
+            assets,             // Os ativos que serão emprestados
+            amounts,            // As quantidades que serão emprestadas
+            interestRateModes,  // O modo de taxa de juros
+            address(this),      // Endereço do contrato a ser chamado de volta
+            params,             // Parâmetros adicionais para passar para o callback
+            0                   // RefCode (não utilizado aqui)
+        ) {
+            // Emissão de evento caso o flash loan seja bem-sucedido
+            emit FlashLoanSuccess(msg.sender, loanAmount);
+        } catch Error(string memory reason) {
+            // Captura o erro com mensagem de razão explícita
+            emit FlashLoanFailure(msg.sender, reason);
+            emit DebugFlashLoanCall(msg.sender, false, reason);
+            return;
+        } catch (bytes memory lowLevelData) {
+            // Captura erros sem mensagem clara (low-level)
+            string memory decodedReason = _getRevertMsg(lowLevelData);
+            emit FlashLoanFailure(msg.sender, decodedReason);
+            emit DebugFlashLoanCall(msg.sender, false, decodedReason);
+            return;
+        }
+        // Incrementa a contagem de arbitragem para o usuário
+        userLicense.arbitrageCount++;
+        emit Debug(string(abi.encodePacked("Nova contagem de arbitragem: ", Strings.toString(userLicense.arbitrageCount))));
+
+        // Verifica se o limite diário de arbitragem foi atingido e emite evento de pausa
+        if (userLicense.arbitrageCount >= userLicense.dailyLimit) {
+            emit ArbitragePaused(msg.sender);
+        }
+    }
+
+        /**
+        * @dev Função auxiliar para decodificar a mensagem de erro de baixo nível (low-level revert).
+        * @param _returnData Os dados de retorno da chamada.
+        * @return A mensagem de erro decodificada ou uma mensagem padrão se os dados forem inválidos.
+        */
+    function _getRevertMsg(bytes memory _returnData) internal pure returns (string memory) {
+        if (_returnData.length < 68) return "Transaction reverted silently";
+        assembly {
+        _returnData := add(_returnData, 0x04) // Ignora o seletor de função
+        }
+            return abi.decode(_returnData, (string)); // Decodifica a string de erro
+    }
+
+    event LicenseDeactivated(address indexed user, uint256 timestamp);
+    event Debug(string message);
+    
+    function executeOperation(
+        address[] memory assets,
+        uint256[] memory amounts,
+        uint256[] memory premiums,
+        address initiator,
+        bytes memory params
+    ) external returns (bool) {
+        require(msg.sender == aaveLendingPool, "Only Aave Pool can call");
+        require(initiator == address(this), "Invalid initiator");
+        require(assets[0] == assetToTrade, "Asset mismatch");
+
+        (address user, uint256 amount) = abi.decode(params, (address, uint256));
+        require(amounts[0] == amount, "Amount mismatch");
+
+        // Log saldo inicial antes dos swaps
+        uint256 initialBalance = IERC20(assetToTrade).balanceOf(address(this));
+        emit Debug(string(abi.encodePacked("Initial balance before swaps: ", initialBalance.toString())));
+
+        // Aprovar os tokens necessários para Uniswap e Sushiswap
+        approveTokenIfNecessary(assetToTrade, uniswapRouter, amount);
+        approveTokenIfNecessary(assetToTrade, sushiswapRouter, amount);
+
+        // Realizar swaps em ciclos
+        for (uint256 i = 0; i < numArbitrageCycles; i++) {
+            uint256 amountOutMin = getAmountOutMin(amount, quoterAddress);
+            emit Debug(string(abi.encodePacked("Amount out min (with slippage): ", amountOutMin.toString())));
+
+            swapTokens(amount, amountOutMin, uniswapRouter);
+            uint256 balanceAfterUniswap = IERC20(assetToTrade).balanceOf(address(this));
+            emit Debug(string(abi.encodePacked("Balance after Uniswap swap: ", balanceAfterUniswap.toString())));
+
+            amountOutMin = getAmountOutMin(amount, quoterAddress);
+            swapTokens(amount, amountOutMin, sushiswapRouter);
+            uint256 balanceAfterSushiswap = IERC20(assetToTrade).balanceOf(address(this));
+            emit Debug(string(abi.encodePacked("Balance after Sushiswap swap: ", balanceAfterSushiswap.toString())));
+        }
+
+        // Saldo final antes de devolver o empréstimo
+        uint256 finalBalance = IERC20(assetToTrade).balanceOf(address(this));
+        emit Debug(string(abi.encodePacked("Final balance before repaying Aave: ", finalBalance.toString())));
+
+        require(finalBalance >= amounts[0] + premiums[0], "Insufficient funds to repay loan");
+
+        uint256 profit = finalBalance - initialBalance - premiums[0];
+        emit Debug(string(abi.encodePacked("Profit calculated: ", profit.toString())));
+
+        // Aceita qualquer lucro positivo, sem necessidade de porcentagem mínima
+        require(profit > 0, "No profit or loss occurred");
+
+        // Transferir lucro para o usuário
+        IERC20(assetToTrade).transfer(user, profit);
+        // Transferir o pagamento do empréstimo para Aave
+        IERC20(assetToTrade).transfer(aaveLendingPool, amounts[0] + premiums[0]);
+
+        // Atualizar o lucro total da licença do usuário
+        License storage userLicense = licenses[user];
+        userLicense.totalProfit += profit;
+
+        // Se o lucro total atingir o limite, desativar a licença permanentemente e permitir nova compra
+        if (userLicense.totalProfit >= (userLicense.price * 7) / 2) {
+            userLicense.active = false;
+            userLicense.price = 0; // Permitir nova compra
+            emit LicenseDeactivated(user, block.timestamp);
+        }
+
+        emit ArbitrageExecuted(user, profit, block.timestamp);
+
+        return true;
+    }
+    
+
+    function approveTokenIfNecessary(
+        address token,
+        address spender,
+        uint256 amount
+    ) internal {
+        uint256 currentAllowance = IERC20(token).allowance(address(this), spender);
+        emit Debug(string(abi.encodePacked("Current allowance for ", spender, ": ", Strings.toString(currentAllowance))));
+
+        if (currentAllowance < amount) {
+            IERC20(token).approve(spender, type(uint256).max);
+            emit Debug(string(abi.encodePacked("Approved max tokens for ", spender)));
+        }
+    }
+
+    event InternalFundWithdrawn(address indexed to, uint256 amount);
+
+    function withdrawInternalFund(address to, uint256 amount) external onlyOwner {
+        require(internalFund >= amount, "Insufficient internal funds");
+        internalFund -= amount;
+        bool success = IERC20(assetToTrade).transfer(to, amount);
+        require(success, "Transfer failed");
+        emit InternalFundWithdrawn(to, amount);
+    }
+}
